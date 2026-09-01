@@ -7,7 +7,7 @@ load_dotenv()
 
 # Cloud API Models
 AI_MODEL = os.getenv("AI_MODEL", "gemini/gemini-3.6-flash")
-FALLBACK_MODELS = eval(os.getenv("FALLBACK_MODELS", '["groq/llama-3.1-8b-instant", "openai/gpt-4o-mini" ]'))
+FALLBACK_MODELS = ["groq/llama-3.1-8b-instant", "openai/gpt-4o-mini" ]
 
 
 # Local vLLM (Phase 3)
