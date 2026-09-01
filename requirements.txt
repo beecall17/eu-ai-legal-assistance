@@ -1,0 +1,47 @@
+# Core
+langchain
+langchain-community
+chromadb
+sentence-transformers
+rank-bm25
+
+# LLM & Orchestration
+litellm
+instructor
+openai
+anthropic
+groq
+google-generativeai
+
+# Serving & Optimization (Phase 3)
+vllm
+tensorrt-llm
+onnx
+onnxruntime
+torch
+# Note: For CUDA versions, refer to PyTorch website.
+
+# Frontend & API
+fastapi
+uvicorn
+streamlit
+pydantic-settings
+
+# Monitoring & Evaluation
+locust
+pandas
+matplotlib
+scikit-learn
+jupyter
+
+# Distributed Training (Phase 4)
+torch
+torchvision
+torchaudio  # or just torch for DDP
+accelerate
+deepspeed
+
+# Utilities
+python-dotenv
+typing-extensions
+pydantic

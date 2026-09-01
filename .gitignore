@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+data/chunks/
+data/embeddings/
+data/chromadb/
+*.log
+*.pkl
+*.onnx
+*.engine
+*.bin
+.DS_Store
+venv/
+.venv/
