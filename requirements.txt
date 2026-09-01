@@ -14,11 +14,11 @@ groq
 google-generativeai
 
 # Serving & Optimization (Phase 3)
-vllm
-tensorrt-llm
-onnx
-onnxruntime
-torch
+# vllm
+# tensorrt-llm
+# onnx
+# onnxruntime
+# torch
 # Note: For CUDA versions, refer to PyTorch website.
 
 # Frontend & API
@@ -35,11 +35,11 @@ scikit-learn
 jupyter
 
 # Distributed Training (Phase 4)
-torch
-torchvision
-torchaudio  # or just torch for DDP
-accelerate
-deepspeed
+# torch
+# torchvision
+# torchaudio  # or just torch for DDP
+# accelerate
+# deepspeed
 
 # Utilities
 python-dotenv
