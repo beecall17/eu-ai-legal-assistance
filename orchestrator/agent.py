@@ -38,6 +38,7 @@ class Orchestrator:
                 tools=self.tools,
                 tool_choice="auto",  # Let the model decide
                 temperature=0.1,      # Low temperature for consistent routing
+                max_retries=3,
             )
             return response
         except Exception as e:
@@ -80,18 +81,23 @@ class Orchestrator:
 
         # 2. Extract the tool call if present
         message = response.choices[0].message
-        tool_calls = message.get("tool_calls", None)
+        tool_calls = message.get("tool_calls", [])
 
         if tool_calls:
-            # We'll handle only the first tool call for simplicity
-            tool_call = tool_calls[0]
-            tool_name = tool_call.function.name
-            arguments = json.loads(tool_call.function.arguments)
-            result = self._execute_tool(tool_name, arguments)
-            return result
+            results = []
+            for tool_call in tool_calls:
+                tool_name = tool_call.function.name
+                arguments = json.loads(tool_call.function.arguments)
+                result = self._execute_tool(tool_name, arguments)
+                results.append(f"[{tool_name}]:\n{result}")
+            # Combine all results
+            return "\n\n".join(results)
         else:
-            # No tool called; return the direct response
-            return message.content.strip()
+            # No tools called. If the response is too short or generic, we could ask the model to rephrase.
+            direct_response = message.content.strip()
+            if not direct_response:
+                return "I'm not sure how to help with that query. Could you rephrase?"
+            return direct_response
 
 # Convenience function for easy use
 def orchestrate(user_query: str, context_text: str) -> str:
