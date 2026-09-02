@@ -1,129 +1,2081 @@
-# scripts/ingest_data.py
-import re
-import os
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""
+EU AI Act PDF ingestion pipeline.
 
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+Pipeline:
+    PDF
+      ↓
+    PyMuPDF4LLM page-aware extraction
+      ↓
+    Text cleaning
+      ↓
+    Legal section detection
+      ├── Preamble
+      ├── Recitals 1–180
+      ├── Articles 1–113
+      └── Annexes I–XIII
+      ↓
+    Parent legal documents
+      ↓
+    Child chunks
+      ↓
+    Stable IDs + metadata
+      ↓
+    ChromaDB staging collection
+      ↓
+    Validation
+      ↓
+    Production collection
+
+Run:
+    python3 scripts/ingest_data.py
+
+Important:
+    The PDF supplied to this script determines the legal version being
+    indexed. Set LEGAL_VERSION below to the exact consolidated/original
+    version represented by that PDF.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import sys
+from pathlib import Path
+from typing import Any, Dict, List
+
 import pymupdf4llm
-from rag.vector_store import VectorStore
-from config.settings import EMBEDDING_MODEL, CHROMA_DB_PATH
+from langchain_core.documents import Document
 from tqdm import tqdm
 
 
-def load_and_chunk_pdf(
-    file_path: str,
-    child_chunk_size: int = 400,
-    child_chunk_overlap: int = 50
-) -> list[Document]:
+# ---------------------------------------------------------------------------
+# Project root
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ---------------------------------------------------------------------------
+# Project imports
+# ---------------------------------------------------------------------------
+
+from config.settings import CHROMA_DB_PATH, EMBEDDING_MODEL
+from rag.vector_store import VectorStore
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+PDF_PATH = (
+    PROJECT_ROOT
+    / "data"
+    / "raw"
+    / "eu_ai_act.pdf"
+)
+
+COLLECTION_NAME = "eu_ai_act"
+
+# IMPORTANT:
+# Change this to match the exact PDF you place at PDF_PATH.
+#
+# Example for the current consolidated text reviewed previously:
+# LEGAL_VERSION = "2026-07-27"
+#
+# If your PDF is the original 2024 publication, use its actual version
+# instead, e.g. "2024-07-12".
+LEGAL_VERSION = "2026-07-27"
+
+DOCUMENT_NAME = "Regulation (EU) 2024/1689"
+DOCUMENT_TITLE = "Artificial Intelligence Act"
+SOURCE_NAME = "eu_ai_act.pdf"
+
+EXPECTED_RECITALS = 180
+EXPECTED_ARTICLES = 113
+EXPECTED_ANNEXES = [
+    "I",
+    "II",
+    "III",
+    "IV",
+    "V",
+    "VI",
+    "VII",
+    "VIII",
+    "IX",
+    "X",
+    "XI",
+    "XII",
+    "XIII",
+]
+
+# Target size is a soft limit. Legal boundaries always take precedence.
+CHILD_CHUNK_SIZE = 800
+CHILD_CHUNK_OVERLAP = 0
+LONG_UNIT_OVERLAP = 80
+
+SAMPLE_CHUNKS = 10
+
+EMBEDDING_BATCH_SIZE = 64
+
+
+# ---------------------------------------------------------------------------
+# Regex patterns
+# ---------------------------------------------------------------------------
+
+# Explicit recital marker:
+#
+#     (1) ...
+#     (2) ...
+#
+# This is intentionally NOT combined with Article paragraph matching.
+RECITAL_PATTERN = re.compile(
+    r"^\s*\((\d{1,3})\)\s+",
+    flags=re.MULTILINE,
+)
+
+ARTICLE_PATTERN = re.compile(
+    r"^\s*Article\s+(\d+)\b",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+ANNEX_PATTERN = re.compile(
+    r"^\s*ANNEX\s+([IVXLCDM]+)\b",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+CHAPTER_PATTERN = re.compile(
+    r"^\s*CHAPTER\s+([IVXLCDM]+)\b",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def normalize_whitespace(text: str) -> str:
+    """Normalize whitespace while preserving paragraph boundaries."""
+
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\r\n",
+        "\n",
+    ).replace(
+        "\r",
+        "\n",
+    )
+
+    text = re.sub(
+        r"[ \t]+\n",
+        "\n",
+        text,
+    )
+
+    text = re.sub(
+        r"[ \t]{2,}",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
+
+
+def clean_pdf_text(text: str) -> str:
     """
-    Load a PDF, convert to markdown, then split hierarchically.
-    
-    Returns:
-        A list of child Document objects (the fine-grained chunks used for retrieval).
-        Each child Document contains:
-            - page_content: The text of the chunk.
-            - metadata: Includes the parent header hierarchy (Chapter/Article/Annex).
+    Clean common PDF extraction artifacts.
+
+    The cleaning is intentionally conservative because this is legal text.
     """
-    # 1. Check if file exists
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"PDF not found at {file_path}. Please place eu_ai_act.pdf in data/raw/")
 
-    # 2. Convert PDF to Markdown (preserves headings)
-    print(f"📄 Loading PDF from: {file_path}")
-    md_text = pymupdf4llm.to_markdown(
-        file_path,
-        remove_headers_footers=True
+    if not text:
+        return ""
+
+    # Remove Markdown heading markers generated by PyMuPDF4LLM.
+    text = re.sub(
+        r"^\s*#{1,6}\s*",
+        "",
+        text,
+        flags=re.MULTILINE,
     )
 
-    # Remove page numbers like "43/144"
-    md_text = re.sub(r'^\s*\d+\s*/\s*\d+\s*$', '', md_text, flags=re.MULTILINE)
-
-    # Remove standalone "EN" (with possible spaces)
-    md_text = re.sub(r'^\s*EN\s*$', '', md_text, flags=re.MULTILINE)
-
-    # Remove "OJ L, ..." lines (with possible spaces or non-breaking spaces)
-    md_text = re.sub(r'^\s*OJ\s*L,.*$', '', md_text, flags=re.MULTILINE)
-
-    # Optional: strip "Text with EEA relevance"
-    md_text = re.sub(r'^\s*Text with EEA relevance\s*$', '', md_text, flags=re.MULTILINE)
-
-
-    print(f"✅ Loaded PDF. Markdown length: {len(md_text)} characters.")
-
-    # 3. Split by structural headers (Chapters, Articles, Annexes)
-    headers_to_split_on = [
-        ("#", "CHAPTER"),
-        ("##", "Article"),
-        ("#", "ANNEX")
-    ]
-    
-    header_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=headers_to_split_on,
-        strip_headers=False  # Keep the header text in the content
+    # Remove Markdown emphasis markers.
+    text = text.replace(
+        "**",
+        "",
     )
-    
-    parent_docs = header_splitter.split_text(md_text)
-    print(f"✅ Created {len(parent_docs)} structural parent sections (Chapters/Articles/Annexes).")
 
-    # 4. Split each parent into smaller child chunks for vector search
-    child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=child_chunk_size,
-        chunk_overlap=child_chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
-        length_function=len,
+    text = text.replace(
+        "__",
+        "",
     )
-    
-    all_child_docs = []
-    for parent in tqdm(parent_docs, desc="Splitting parents into children"):
-        # Create child chunks from the parent's content.
-        # We pass the parent's metadata to each child so we know which Article it belongs to.
-        children = child_splitter.create_documents(
-            texts=[parent.page_content],
-            metadatas=[parent.metadata]  # Propagate the header hierarchy to every child
+
+    # Remove page counters such as:
+    #
+    #     43/144
+    #
+    text = re.sub(
+        r"^\s*\d+\s*/\s*\d+\s*$",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # Remove standalone language markers.
+    text = re.sub(
+        r"^\s*EN\s*$",
+        "",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    # Remove Official Journal metadata lines.
+    text = re.sub(
+        r"^\s*OJ\s+L,.*$",
+        "",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"^\s*Text with EEA relevance\s*$",
+        "",
+        text,
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+
+    # Remove repeated Official Journal header lines while preserving
+    # the first occurrence if one exists.
+    lines = text.splitlines()
+
+    seen_oj_header = False
+    cleaned_lines: List[str] = []
+
+    for line in lines:
+        normalized = line.strip().lower()
+
+        if (
+            normalized
+            == "official journal of the european union"
+        ):
+            if seen_oj_header:
+                continue
+
+            seen_oj_header = True
+
+        cleaned_lines.append(line)
+
+    return normalize_whitespace(
+        "\n".join(cleaned_lines)
+    )
+
+
+def sha256_file(
+    file_path: Path,
+) -> str:
+    """Calculate SHA-256 for the source PDF."""
+
+    digest = hashlib.sha256()
+
+    with file_path.open(
+        "rb"
+    ) as file:
+        for block in iter(
+            lambda: file.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+def roman_to_int(value: str) -> int:
+    """Convert a valid Roman numeral to an integer."""
+
+    values = {
+        "I": 1,
+        "V": 5,
+        "X": 10,
+        "L": 50,
+        "C": 100,
+        "D": 500,
+        "M": 1000,
+    }
+
+    value = value.upper().strip()
+
+    if not value:
+        raise ValueError(
+            "Roman numeral cannot be empty."
         )
-        all_child_docs.extend(children)
-    
-    print(f"✅ Created {len(all_child_docs)} child chunks for vector indexing.")
-    
-    # Optional: Print a sample to verify
-    if all_child_docs:
-        sample = all_child_docs[0]
-        print(f"\n📌 Sample child chunk metadata: {sample.metadata}")
-        print(f"📝 Sample child chunk preview: {sample.page_content[:150]}...\n")
-    
-    return all_child_docs
 
-def ingest():
-    """Main ingestion pipeline: Load PDF -> Chunk -> Embed -> Store in ChromaDB."""
-    
-    # 1. Load and chunk the PDF
-    child_docs = load_and_chunk_pdf("data/raw/eu_ai_act.pdf")
-    
-    if not child_docs:
-        print("❌ No chunks generated. Exiting.")
-        return
-    
-    # 2. Initialize Vector Store (creates the DB if it doesn't exist)
-    vs = VectorStore(
-        collection_name="eu_ai_act",
-        embedding_model=EMBEDDING_MODEL,
-        persist_directory=CHROMA_DB_PATH
+    if not re.fullmatch(
+        r"[IVXLCDM]+",
+        value,
+    ):
+        raise ValueError(
+            f"Invalid Roman numeral: {value!r}"
+        )
+
+    total = 0
+    previous = 0
+
+    for char in reversed(value):
+        current = values[char]
+
+        if current < previous:
+            total -= current
+        else:
+            total += current
+
+        previous = current
+
+    return total
+
+
+# ---------------------------------------------------------------------------
+# PDF extraction
+# ---------------------------------------------------------------------------
+
+def load_pdf_pages(
+    file_path: Path,
+) -> List[Dict[str, Any]]:
+    """
+    Extract the PDF page-by-page.
+
+    PyMuPDF4LLM's page_chunks mode provides page-level metadata,
+    including a 1-based page number.
+    """
+
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"PDF not found: {file_path}"
+        )
+
+    print(
+        f"📄 Loading PDF: {file_path}"
     )
-    
-    # 3. Extract texts and metadata for the vector store
-    texts = [doc.page_content for doc in child_docs]
-    metadatas = [doc.metadata for doc in child_docs]
-    # Filter out any chunks with empty metadata
-    valid_pairs = [(t, m) for t, m in zip(texts, metadatas) if m and len(m) > 0]
-    if valid_pairs:
-        texts, metadatas = zip(*valid_pairs)
-        texts, metadatas = list(texts), list(metadatas)
 
-    # 4. Add documents
-    vs.add_documents(texts, metadatas=metadatas)
-    print(f"✅ Successfully ingested {len(texts)} chunks into ChromaDB at {CHROMA_DB_PATH}")
+    pages = pymupdf4llm.to_text(
+        str(file_path),
+        margins=(0, 50, 0, 50),
+        header=False,
+        footer=False,
+        page_chunks=True,
+        show_progress=True,
+    )
+
+    if not isinstance(
+        pages,
+        list,
+    ):
+        raise RuntimeError(
+            "Expected page_chunks=True to return a list."
+        )
+
+    normalized_pages: List[Dict[str, Any]] = []
+
+    for index, page in enumerate(pages):
+        page_number = page.get(
+            "metadata",
+            {},
+        ).get(
+            "page_number",
+            index + 1,
+        )
+
+        page_text = clean_pdf_text(
+            page.get(
+                "text",
+                "",
+            )
+        )
+
+        if not page_text:
+            continue
+
+        normalized_pages.append(
+            {
+                "page_number": int(page_number),
+                "text": page_text,
+            }
+        )
+
+    if not normalized_pages:
+        raise RuntimeError(
+            "PDF extraction produced no text."
+        )
+
+    return normalized_pages
+
+
+def combine_pages(
+    pages: List[Dict[str, Any]],
+) -> str:
+    """
+    Combine page text while inserting a private page marker.
+
+    The marker is removed before final chunking but lets the section
+    parser calculate source page ranges.
+    """
+
+    parts: List[str] = []
+
+    for page in pages:
+        page_number = page["page_number"]
+
+        parts.append(
+            f"\n\n"
+            f"[[PAGE_{page_number}]]"
+            f"\n\n"
+        )
+
+        parts.append(
+            page["text"]
+        )
+
+    return normalize_whitespace(
+        "".join(parts)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page metadata
+# ---------------------------------------------------------------------------
+
+PAGE_MARKER_PATTERN = re.compile(
+    r"\[\[PAGE_(\d+)\]\]"
+)
+
+
+def page_at_position(
+    text: str,
+    position: int,
+) -> int | None:
+    """Return the most recent source page marker."""
+
+    page_number: int | None = None
+
+    for match in PAGE_MARKER_PATTERN.finditer(
+        text,
+        0,
+        position,
+    ):
+        page_number = int(
+            match.group(1)
+        )
+
+    return page_number
+
+
+def page_range_for_span(
+    text: str,
+    start: int,
+    end: int,
+) -> tuple[int | None, int | None]:
+    """Return source page start/end for a text span."""
+
+    start_page = page_at_position(
+        text,
+        start,
+    )
+
+    end_page = page_at_position(
+        text,
+        end,
+    )
+
+    return start_page, end_page
+
+
+# ---------------------------------------------------------------------------
+# Legal section detection
+# ---------------------------------------------------------------------------
+
+def find_first_valid_recital_start(
+    text: str,
+) -> re.Match[str]:
+    """
+    Find the first explicit recital marker.
+
+    We require the first recital to be '(1)'.
+    """
+
+    for match in RECITAL_PATTERN.finditer(
+        text
+    ):
+        if int(match.group(1)) == 1:
+            return match
+
+    raise RuntimeError(
+        "Could not find Recital (1). "
+        "The PDF structure may be incompatible with this parser."
+    )
+
+
+def find_sequential_recitals(
+    text: str,
+    start_position: int,
+) -> List[re.Match[str]]:
+    """
+    Find the expected recital sequence beginning at (1).
+
+    Parsing stops before the first Article marker after the recital
+    sequence, preventing Article paragraph '(1)' markers from being
+    interpreted as recitals.
+    """
+
+    article_matches = list(
+        ARTICLE_PATTERN.finditer(
+            text,
+            start_position,
+        )
+    )
+
+    article_boundary = (
+        article_matches[0].start()
+        if article_matches
+        else len(text)
+    )
+
+    recital_matches: List[
+        re.Match[str]
+    ] = []
+
+    expected_number = 1
+
+    for match in RECITAL_PATTERN.finditer(
+        text,
+        start_position,
+        article_boundary,
+    ):
+        number = int(
+            match.group(1)
+        )
+
+        if number != expected_number:
+            continue
+
+        recital_matches.append(
+            match
+        )
+
+        expected_number += 1
+
+        if (
+            expected_number
+            > EXPECTED_RECITALS
+        ):
+            break
+
+    if len(recital_matches) != EXPECTED_RECITALS:
+        last_found = (
+            recital_matches[-1].group(1)
+            if recital_matches
+            else "none"
+        )
+
+        raise RuntimeError(
+            "Could not reliably detect all "
+            f"{EXPECTED_RECITALS} recitals. "
+            f"Last sequential recital found: "
+            f"{last_found}."
+        )
+
+    return recital_matches
+
+
+def find_first_article_after_recitals(
+    text: str,
+    recital_matches: List[
+        re.Match[str]
+    ],
+) -> re.Match[str]:
+    """Find Article 1 after the final recital."""
+
+    recital_end = (
+        recital_matches[-1].end()
+    )
+
+    candidates = list(
+        ARTICLE_PATTERN.finditer(
+            text,
+            recital_end,
+        )
+    )
+
+    for match in candidates:
+        if int(match.group(1)) == 1:
+            return match
+
+    raise RuntimeError(
+        "Could not find Article 1 after Recital 180."
+    )
+
+
+def find_sequential_articles(
+    text: str,
+    first_article: re.Match[str],
+) -> List[re.Match[str]]:
+    """
+    Find Article 1 through Article 113 sequentially.
+
+    Starting after the real recital section prevents the table of
+    contents from being selected as the Article 1 boundary.
+    """
+
+    matches: List[
+        re.Match[str]
+    ] = []
+
+    expected_number = 1
+
+    for match in ARTICLE_PATTERN.finditer(
+        text,
+        first_article.start(),
+    ):
+        number = int(
+            match.group(1)
+        )
+
+        if number != expected_number:
+            continue
+
+        matches.append(
+            match
+        )
+
+        expected_number += 1
+
+        if (
+            expected_number
+            > EXPECTED_ARTICLES
+        ):
+            break
+
+    if len(matches) != EXPECTED_ARTICLES:
+        last_found = (
+            matches[-1].group(1)
+            if matches
+            else "none"
+        )
+
+        raise RuntimeError(
+            "Could not reliably detect all "
+            f"{EXPECTED_ARTICLES} Articles. "
+            f"Last sequential Article found: "
+            f"{last_found}."
+        )
+
+    return matches
+
+
+def find_first_annex_after_articles(
+    text: str,
+    article_matches: List[
+        re.Match[str]
+    ],
+) -> re.Match[str]:
+    """Find Annex I after Article 113."""
+
+    article_end = (
+        article_matches[-1].end()
+    )
+
+    for match in ANNEX_PATTERN.finditer(
+        text,
+        article_end,
+    ):
+        if match.group(1).upper() == "I":
+            return match
+
+    raise RuntimeError(
+        "Could not find ANNEX I after Article 113."
+    )
+
+
+def find_sequential_annexes(
+    text: str,
+    first_annex: re.Match[str],
+) -> List[re.Match[str]]:
+    """Find Annex I through Annex XIII sequentially."""
+
+    matches: List[
+        re.Match[str]
+    ] = []
+
+    expected_index = 1
+
+    for match in ANNEX_PATTERN.finditer(
+        text,
+        first_annex.start(),
+    ):
+        numeral = match.group(1).upper()
+
+        if (
+            roman_to_int(numeral)
+            != expected_index
+        ):
+            continue
+
+        matches.append(
+            match
+        )
+
+        expected_index += 1
+
+        if (
+            expected_index
+            > len(EXPECTED_ANNEXES)
+        ):
+            break
+
+    detected = [
+        match.group(1).upper()
+        for match in matches
+    ]
+
+    if detected != EXPECTED_ANNEXES:
+        raise RuntimeError(
+            "Could not reliably detect Annexes. "
+            f"Expected {EXPECTED_ANNEXES}; "
+            f"found {detected}."
+        )
+
+    return matches
+
+
+def make_section(
+    text: str,
+    section_type: str,
+    section_number: str,
+    section_id: str,
+    heading: str,
+    start: int,
+    end: int,
+) -> Dict[str, Any]:
+    """Build a normalized section dictionary."""
+
+    content = text[start:end].strip()
+
+    content = PAGE_MARKER_PATTERN.sub(
+        "",
+        content,
+    )
+
+    content = normalize_whitespace(
+        content
+    )
+
+    page_start, page_end = page_range_for_span(
+        text,
+        start,
+        end,
+    )
+
+    return {
+        "section_type": section_type,
+        "section_number": section_number,
+        "section_id": section_id,
+        "heading": heading,
+        "content": content,
+        "page_start": page_start,
+        "page_end": page_end,
+    }
+
+
+def split_into_sections(
+    text: str,
+) -> List[Dict[str, Any]]:
+    """
+    Split the document into legal sections.
+
+    The parser deliberately uses structural phases:
+
+        Preamble
+        Recitals 1-180
+        Articles 1-113
+        Annexes I-XIII
+
+    This is safer than treating every occurrence of 'Article N' as
+    an actual legal-section boundary.
+    """
+
+    if not text.strip():
+        raise RuntimeError(
+            "Cannot parse empty document text."
+        )
+
+    recital_start = (
+        find_first_valid_recital_start(
+            text
+        )
+    )
+
+    recital_matches = (
+        find_sequential_recitals(
+            text,
+            recital_start.start(),
+        )
+    )
+
+    first_article = (
+        find_first_article_after_recitals(
+            text,
+            recital_matches,
+        )
+    )
+
+    article_matches = (
+        find_sequential_articles(
+            text,
+            first_article,
+        )
+    )
+
+    first_annex = (
+        find_first_annex_after_articles(
+            text,
+            article_matches,
+        )
+    )
+
+    annex_matches = (
+        find_sequential_annexes(
+            text,
+            first_annex,
+        )
+    )
+
+    sections: List[
+        Dict[str, Any]
+    ] = []
+
+    # ---------------------------------------------------------------
+    # Preamble
+    # ---------------------------------------------------------------
+
+    preamble_start = 0
+    preamble_end = recital_matches[0].start()
+
+    preamble = make_section(
+        text=text,
+        section_type="preamble",
+        section_number="",
+        section_id="preamble",
+        heading="Preamble",
+        start=preamble_start,
+        end=preamble_end,
+    )
+
+    if preamble["content"]:
+        sections.append(
+            preamble
+        )
+
+    # ---------------------------------------------------------------
+    # Recitals
+    # ---------------------------------------------------------------
+
+    for index, match in enumerate(
+        recital_matches
+    ):
+        start = match.start()
+
+        if index + 1 < len(
+            recital_matches
+        ):
+            end = recital_matches[
+                index + 1
+            ].start()
+        else:
+            end = first_article.start()
+
+        number = match.group(1)
+
+        sections.append(
+            make_section(
+                text=text,
+                section_type="recital",
+                section_number=number,
+                section_id=f"recital_{number}",
+                heading=f"Recital {number}",
+                start=start,
+                end=end,
+            )
+        )
+
+    # ---------------------------------------------------------------
+    # Articles
+    # ---------------------------------------------------------------
+
+    for index, match in enumerate(
+        article_matches
+    ):
+        start = match.start()
+
+        if index + 1 < len(
+            article_matches
+        ):
+            end = article_matches[
+                index + 1
+            ].start()
+        else:
+            end = first_annex.start()
+
+        number = match.group(1)
+
+        sections.append(
+            make_section(
+                text=text,
+                section_type="article",
+                section_number=number,
+                section_id=f"article_{number}",
+                heading=f"Article {number}",
+                start=start,
+                end=end,
+            )
+        )
+
+    # ---------------------------------------------------------------
+    # Annexes
+    # ---------------------------------------------------------------
+
+    for index, match in enumerate(
+        annex_matches
+    ):
+        start = match.start()
+
+        if index + 1 < len(
+            annex_matches
+        ):
+            end = annex_matches[
+                index + 1
+            ].start()
+        else:
+            end = len(text)
+
+        numeral = match.group(1).upper()
+
+        sections.append(
+            make_section(
+                text=text,
+                section_type="annex",
+                section_number=numeral,
+                section_id=(
+                    f"annex_"
+                    f"{numeral.lower()}"
+                ),
+                heading=f"ANNEX {numeral}",
+                start=start,
+                end=end,
+            )
+        )
+
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_sections(
+    sections: List[Dict[str, Any]],
+) -> None:
+    """Strictly validate the expected legal structure."""
+
+    print("\n🔍 Section validation")
+
+    counts: Dict[str, int] = {}
+
+    for section in sections:
+        section_type = section[
+            "section_type"
+        ]
+
+        counts[section_type] = (
+            counts.get(
+                section_type,
+                0,
+            )
+            + 1
+        )
+
+    for section_type in (
+        "preamble",
+        "recital",
+        "article",
+        "annex",
+    ):
+        print(
+            f"   {section_type}: "
+            f"{counts.get(section_type, 0)}"
+        )
+
+    # ---------------------------------------------------------------
+    # Recitals
+    # ---------------------------------------------------------------
+
+    recital_numbers = [
+        int(section["section_number"])
+        for section in sections
+        if section["section_type"]
+        == "recital"
+    ]
+
+    expected_recitals = list(
+        range(
+            1,
+            EXPECTED_RECITALS + 1,
+        )
+    )
+
+    if recital_numbers != expected_recitals:
+        raise RuntimeError(
+            "Recital validation failed. "
+            f"Expected {expected_recitals[0]}-"
+            f"{expected_recitals[-1]}, "
+            f"found {recital_numbers[:10]}..."
+        )
+
+    print(
+        f"   ✅ Recitals 1-{EXPECTED_RECITALS}"
+        " detected."
+    )
+
+    # ---------------------------------------------------------------
+    # Articles
+    # ---------------------------------------------------------------
+
+    article_numbers = [
+        int(section["section_number"])
+        for section in sections
+        if section["section_type"]
+        == "article"
+    ]
+
+    expected_articles = list(
+        range(
+            1,
+            EXPECTED_ARTICLES + 1,
+        )
+    )
+
+    if article_numbers != expected_articles:
+        raise RuntimeError(
+            "Article validation failed. "
+            f"Expected Articles 1-{EXPECTED_ARTICLES}, "
+            f"found {article_numbers[:10]}..."
+        )
+
+    print(
+        f"   ✅ Articles 1-{EXPECTED_ARTICLES}"
+        " detected."
+    )
+
+    # ---------------------------------------------------------------
+    # Annexes
+    # ---------------------------------------------------------------
+
+    annex_numbers = [
+        section["section_number"]
+        for section in sections
+        if section["section_type"]
+        == "annex"
+    ]
+
+    if annex_numbers != EXPECTED_ANNEXES:
+        raise RuntimeError(
+            "Annex validation failed. "
+            f"Expected {EXPECTED_ANNEXES}; "
+            f"found {annex_numbers}."
+        )
+
+    print(
+        "   ✅ Annexes I-XIII detected."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parent documents
+# ---------------------------------------------------------------------------
+
+def create_parent_documents(
+    sections: List[Dict[str, Any]],
+    source_sha256: str,
+) -> List[Document]:
+    """Convert legal sections into LangChain parent Documents."""
+
+    parent_documents: List[
+        Document
+    ] = []
+
+    for section in sections:
+        metadata = {
+            "source": SOURCE_NAME,
+            "source_sha256": source_sha256,
+            "document": DOCUMENT_NAME,
+            "document_title": DOCUMENT_TITLE,
+            "legal_version": LEGAL_VERSION,
+
+            "section_type": section[
+                "section_type"
+            ],
+
+            "section_number": str(
+                section["section_number"]
+            ),
+
+            "section_id": section[
+                "section_id"
+            ],
+
+            "heading": section[
+                "heading"
+            ],
+
+            "page_start": (
+                section["page_start"]
+                if section["page_start"]
+                is not None
+                else 0
+            ),
+
+            "page_end": (
+                section["page_end"]
+                if section["page_end"]
+                is not None
+                else 0
+            ),
+
+            "title": (
+                DOCUMENT_TITLE
+                if section["section_type"]
+                == "preamble"
+                else section["heading"]
+            ),
+        }
+
+        parent_documents.append(
+            Document(
+                page_content=section[
+                    "content"
+                ],
+                metadata=metadata,
+            )
+        )
+
+    return parent_documents
+
+
+# ---------------------------------------------------------------------------
+# Child chunking
+# ---------------------------------------------------------------------------
+
+
+def _split_long_legal_unit(
+    text: str,
+    chunk_size: int,
+    overlap: int,
+) -> List[str]:
+    """Split one oversized legal unit at sentence/clause boundaries."""
+    text = normalize_whitespace(text)
+    if len(text) <= chunk_size:
+        return [text]
+
+    separators = ["\n\n", "\n", ". ", "; ", ": ", ", ", " "]
+    pieces = [text]
+
+    for separator in separators:
+        if all(len(piece) <= chunk_size for piece in pieces):
+            break
+
+        next_pieces: List[str] = []
+        for piece in pieces:
+            if len(piece) <= chunk_size:
+                next_pieces.append(piece)
+                continue
+
+            parts = piece.split(separator)
+            if len(parts) == 1:
+                next_pieces.append(piece)
+                continue
+
+            current = ""
+            rebuilt: List[str] = []
+            for part in parts:
+                candidate = (
+                    part.strip()
+                    if not current
+                    else f"{current}{separator}{part}".strip()
+                )
+                if len(candidate) <= chunk_size:
+                    current = candidate
+                else:
+                    if current:
+                        rebuilt.append(current)
+                    current = part.strip()
+            if current:
+                rebuilt.append(current)
+            next_pieces.extend(rebuilt)
+
+        pieces = next_pieces
+
+    final: List[str] = []
+    for piece in pieces:
+        if len(piece) <= chunk_size:
+            final.append(piece)
+            continue
+
+        start = 0
+        while start < len(piece):
+            end = min(start + chunk_size, len(piece))
+            final.append(piece[start:end].strip())
+            if end >= len(piece):
+                break
+            start = max(start + 1, end - overlap)
+
+    # Avoid tiny fragments where possible.
+    merged: List[str] = []
+    for piece in final:
+        if (
+            merged
+            and len(piece) < 120
+            and len(merged[-1]) + 1 + len(piece) <= chunk_size
+        ):
+            merged[-1] = f"{merged[-1]} {piece}".strip()
+        else:
+            merged.append(piece)
+
+    return [piece for piece in merged if piece]
+
+
+def _extract_article_units(content: str) -> tuple[str, List[str]]:
+    """Extract Article title/context and atomic top-level paragraphs."""
+    content = normalize_whitespace(content)
+
+    match = re.match(
+        r"^\s*Article\s+(\d+)\b",
+        content,
+        flags=re.IGNORECASE,
+    )
+    body = content[match.end():].lstrip() if match else content
+
+    paragraph_matches = list(
+        re.finditer(r"(?m)^\s*\((\d+)\)\s+", body)
+    )
+
+    if not paragraph_matches:
+        return body[:300].strip(), [body]
+
+    context = body[:paragraph_matches[0].start()].strip()
+    units: List[str] = []
+
+    for index, paragraph_match in enumerate(paragraph_matches):
+        start = paragraph_match.start()
+        end = (
+            paragraph_matches[index + 1].start()
+            if index + 1 < len(paragraph_matches)
+            else len(body)
+        )
+        units.append(body[start:end].strip())
+
+    return context, units
+
+
+def _extract_recital_unit(content: str) -> tuple[str, List[str]]:
+    """Keep a recital as one unit; oversized recitals are split later."""
+    content = normalize_whitespace(content)
+    return "", [content] if content else []
+
+
+def _extract_annex_units(content: str) -> tuple[str, List[str]]:
+    """
+    Split annexes using blank-line blocks, with numbered blocks as fallback.
+
+    Annexes have substantially more varied formatting than Articles, so this
+    intentionally avoids assuming that every numeric marker is a paragraph.
+    """
+    content = normalize_whitespace(content)
+
+    match = re.match(
+        r"^\s*ANNEX\s+[IVXLCDM]+\b",
+        content,
+        flags=re.IGNORECASE,
+    )
+    body = content[match.end():].lstrip() if match else content
+
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n\s*\n", body)
+        if block.strip()
+    ]
+
+    if len(blocks) > 1:
+        context, units = blocks[0], blocks[1:]
+    else:
+        context, units = "", blocks
+
+    # Fallback for PDFs that flatten all paragraph spacing.
+    if len(units) <= 1 and units:
+        numbered = list(
+            re.finditer(
+                r"(?m)^\s*(\d+(?:\.\d+)*)\.\s+",
+                units[0],
+            )
+        )
+        if len(numbered) >= 2:
+            body = units[0]
+            units = [
+                body[
+                    marker.start():(
+                        numbered[i + 1].start()
+                        if i + 1 < len(numbered)
+                        else len(body)
+                    )
+                ].strip()
+                for i, marker in enumerate(numbered)
+            ]
+            context = ""
+
+    return context, units
+
+
+def _legal_units(section: Dict[str, Any]) -> tuple[str, List[str]]:
+    """Return section context plus legal units that should not be fragmented."""
+    section_type = section["section_type"]
+    content = section["content"]
+
+    if section_type == "article":
+        return _extract_article_units(content)
+
+    if section_type == "recital":
+        return _extract_recital_unit(content)
+
+    if section_type == "annex":
+        return _extract_annex_units(content)
+
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n\s*\n", content)
+        if block.strip()
+    ]
+    return "", blocks or ([content] if content else [])
+
+
+def create_child_chunks(
+    parent_documents: List[Document],
+    chunk_size: int = CHILD_CHUNK_SIZE,
+    chunk_overlap: int = CHILD_CHUNK_OVERLAP,
+) -> List[Document]:
+    """
+    Create structure-aware legal retrieval chunks.
+
+    Normal chunks never cross:
+      * a Recital boundary,
+      * an Article boundary,
+      * an Article top-level paragraph boundary, or
+      * a meaningful Annex block boundary.
+
+    Every stored chunk also contains its legal heading/context, so the
+    embedding does not have to infer what a fragment such as "the provider"
+    refers to.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero.")
+    if chunk_overlap < 0:
+        raise ValueError("chunk_overlap must be >= 0.")
+    if chunk_overlap != 0:
+        raise ValueError(
+            "Use chunk_overlap=0 for legal-aware chunking; "
+            "LONG_UNIT_OVERLAP is used only for oversized legal units."
+        )
+
+    child_documents: List[Document] = []
+
+    for parent in tqdm(parent_documents, desc="Creating legal-aware chunks"):
+        metadata = parent.metadata
+        section_type = metadata["section_type"]
+        section_id = metadata["section_id"]
+        heading = metadata.get("heading", "")
+
+        context, units = _legal_units(
+            {
+                "section_type": section_type,
+                "content": parent.page_content,
+            }
+        )
+
+        if not units:
+            continue
+
+        legal_context = heading
+        if context:
+            legal_context = (
+                f"{heading} — {context}"
+                if heading and context != heading
+                else context
+            )
+
+        # Keep each legal unit atomic. This is deliberately different from
+        # generic RAG chunking: combining Article (1) and Article (2) can make
+        # a retrieved answer look authoritative while mixing two independent
+        # legal propositions.
+        grouped: List[str] = []
+        for unit in units:
+            unit = normalize_whitespace(unit)
+            if not unit:
+                continue
+
+            if len(unit) <= chunk_size:
+                grouped.append(unit)
+            else:
+                grouped.extend(
+                    _split_long_legal_unit(
+                        unit,
+                        chunk_size=chunk_size,
+                        overlap=LONG_UNIT_OVERLAP,
+                    )
+                )
+
+        for chunk_index, body in enumerate(grouped):
+            body = normalize_whitespace(body)
+
+            # This is the actual embedded document. Repeating the legal
+            # context is intentional and materially improves retrieval of
+            # short/clause-level queries.
+            chunk_text = (
+                f"{legal_context}\n\n{body}"
+                if legal_context
+                else body
+            )
+
+            chunk_id = VectorStore.make_chunk_id(
+                section_id=section_id,
+                chunk_index=chunk_index,
+            )
+            content_hash = VectorStore.make_content_hash(chunk_text)
+
+            paragraph_match = re.match(
+                r"^\s*\((\d+)\)\s+",
+                body,
+            )
+            annex_point_match = re.match(
+                r"^\s*(\d+(?:\.\d+)*)\.\s+",
+                body,
+            )
+
+            chunk_metadata = {
+                **metadata,
+                "parent_id": section_id,
+                "chunk_id": chunk_id,
+                "chunk_index": chunk_index,
+                "chunking_strategy": "legal_structure_v2",
+                "legal_unit": (
+                    f"paragraph_{paragraph_match.group(1)}"
+                    if paragraph_match
+                    else (
+                        f"annex_point_{annex_point_match.group(1)}"
+                        if annex_point_match
+                        else "section_unit"
+                    )
+                ),
+                "content_sha256": content_hash,
+            }
+
+            child_documents.append(
+                Document(
+                    page_content=chunk_text,
+                    metadata=chunk_metadata,
+                )
+            )
+
+    return child_documents
+
+
+# Sample output
+# ---------------------------------------------------------------------------
+
+def print_sample_chunks(
+    documents: List[Document],
+    count: int = SAMPLE_CHUNKS,
+) -> None:
+    """Print sample chunks for inspection."""
+
+    sample_count = min(
+        count,
+        len(documents),
+    )
+
+    print(
+        f"\n📌 Sample Chunks "
+        f"({sample_count})"
+    )
+
+    for index, document in enumerate(
+        documents[:count],
+        start=1,
+    ):
+        print(
+            f"\n--- Chunk {index} ---"
+        )
+
+        print(
+            f"Metadata: "
+            f"{document.metadata}"
+        )
+
+        preview = (
+            document.page_content
+            .replace(
+                "\n",
+                " ",
+            )
+            .strip()
+        )
+
+        if len(preview) > 300:
+            preview = (
+                preview[:300]
+                + "..."
+            )
+
+        print(
+            f"Preview: {preview}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Document validation
+# ---------------------------------------------------------------------------
+
+def validate_child_documents(
+    documents: List[Document],
+) -> None:
+    """Validate chunk IDs and required metadata."""
+
+    if not documents:
+        raise RuntimeError(
+            "No child documents were generated."
+        )
+
+    required_metadata = {
+        "source",
+        "source_sha256",
+        "document",
+        "document_title",
+        "legal_version",
+        "section_type",
+        "section_number",
+        "section_id",
+        "parent_id",
+        "chunk_id",
+        "chunk_index",
+        "content_sha256",
+        "page_start",
+        "page_end",
+    }
+
+    ids = set()
+
+    for index, document in enumerate(
+        documents
+    ):
+        metadata = document.metadata
+
+        missing = (
+            required_metadata
+            - set(metadata.keys())
+        )
+
+        if missing:
+            raise RuntimeError(
+                f"Chunk {index} is missing metadata: "
+                f"{sorted(missing)}"
+            )
+
+        chunk_id = metadata[
+            "chunk_id"
+        ]
+
+        if chunk_id in ids:
+            raise RuntimeError(
+                f"Duplicate chunk ID detected: "
+                f"{chunk_id}"
+            )
+
+        ids.add(chunk_id)
+
+        if not document.page_content.strip():
+            raise RuntimeError(
+                f"Chunk {index} contains empty text."
+            )
+
+        if metadata.get("chunking_strategy") != "legal_structure_v2":
+            raise RuntimeError(
+                f"Chunk {index} has an unexpected chunking strategy."
+            )
+
+    print(
+        f"   ✅ Validated {len(documents):,} "
+        "child chunks."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vector store
+# ---------------------------------------------------------------------------
+
+def create_vector_store(
+    collection_name: str = COLLECTION_NAME,
+) -> VectorStore:
+    """Create the project's vector store."""
+
+    print(
+        f"\n🧠 Initializing vector store: "
+        f"{collection_name}"
+    )
+
+    return VectorStore(
+        collection_name=collection_name,
+        embedding_model=EMBEDDING_MODEL,
+        persist_directory=CHROMA_DB_PATH,
+        batch_size=EMBEDDING_BATCH_SIZE,
+        collection_metadata={
+            "document": DOCUMENT_NAME,
+            "document_title": DOCUMENT_TITLE,
+            "legal_version": LEGAL_VERSION,
+            "source": SOURCE_NAME,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Staging ingestion
+# ---------------------------------------------------------------------------
+
+def ingest_documents(
+    child_documents: List[Document],
+) -> None:
+    """
+    Ingest into a staging collection.
+
+    The production collection is untouched until the staging collection
+    has been completely populated and validated.
+    """
+
+    if not child_documents:
+        raise RuntimeError(
+            "No child documents were generated."
+        )
+
+    validate_child_documents(
+        child_documents
+    )
+
+    source_sha256 = child_documents[
+        0
+    ].metadata["source_sha256"]
+
+    staging_collection = (
+        f"{COLLECTION_NAME}__staging"
+    )
+
+    # ---------------------------------------------------------------
+    # Remove stale staging collection only.
+    #
+    # The production collection remains intact while the new dataset
+    # is being generated.
+    # ---------------------------------------------------------------
+
+    staging_store = create_vector_store(
+        staging_collection
+    )
+
+    staging_store.reset_collection()
+
+    texts = [
+        document.page_content
+        for document in child_documents
+    ]
+
+    metadatas = [
+        document.metadata
+        for document in child_documents
+    ]
+
+    ids = [
+        document.metadata[
+            "chunk_id"
+        ]
+        for document in child_documents
+    ]
+
+    print(
+        f"\n📥 Adding {len(texts):,} "
+        "chunks to staging collection..."
+    )
+
+    staging_store.add_documents(
+        texts=texts,
+        metadatas=metadatas,
+        ids=ids,
+    )
+
+    actual_count = (
+        staging_store.count()
+    )
+
+    expected_count = len(
+        child_documents
+    )
+
+    if actual_count != expected_count:
+        raise RuntimeError(
+            "Staging collection validation failed. "
+            f"Expected {expected_count:,} documents; "
+            f"found {actual_count:,}."
+        )
+
+    print(
+        f"   ✅ Staging collection contains "
+        f"{actual_count:,} documents."
+    )
+
+    # ---------------------------------------------------------------
+    # Validate representative legal sections.
+    # ---------------------------------------------------------------
+
+    required_section_ids = [
+        "recital_1",
+        f"recital_{EXPECTED_RECITALS}",
+        "article_1",
+        f"article_{EXPECTED_ARTICLES}",
+        "annex_i",
+        "annex_xiii",
+    ]
+
+    for section_id in required_section_ids:
+        results = staging_store.get(
+            limit=1,
+            where={
+                "section_id": section_id
+            },
+            include=[
+                "documents",
+                "metadatas",
+            ],
+        )
+
+        if not results.get("ids"):
+            raise RuntimeError(
+                "Staging validation failed: "
+                f"section '{section_id}' "
+                "was not found."
+            )
+
+    print(
+        "   ✅ Representative legal sections "
+        "verified."
+    )
+
+    # ---------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # Chroma PersistentClient does not provide a portable filesystem-
+    # level atomic rename of two persistent collections. Therefore this
+    # step intentionally happens only after staging has been completely
+    # validated.
+    #
+    # The old production collection is then replaced.
+    # ---------------------------------------------------------------
+
+    production_store = create_vector_store(
+        COLLECTION_NAME
+    )
+
+    production_store.reset_collection()
+
+    print(
+        "\n📦 Promoting validated staging data "
+        "to production collection..."
+    )
+
+    for offset in range(
+        0,
+        expected_count,
+        500,
+    ):
+        batch = staging_store.get(
+            limit=min(
+                500,
+                expected_count - offset,
+            ),
+            offset=offset,
+            include=[
+                "documents",
+                "metadatas",
+            ],
+        )
+
+        batch_texts = (
+            batch.get("documents")
+            or []
+        )
+
+        batch_metadatas = (
+            batch.get("metadatas")
+            or []
+        )
+
+        batch_ids = (
+            batch.get("ids")
+            or []
+        )
+
+        if not batch_texts:
+            continue
+
+        production_store.add_documents(
+            texts=batch_texts,
+            metadatas=batch_metadatas,
+            ids=batch_ids,
+        )
+
+    final_count = (
+        production_store.count()
+    )
+
+    if final_count != expected_count:
+        raise RuntimeError(
+            "Production collection validation failed. "
+            f"Expected {expected_count:,}; "
+            f"found {final_count:,}."
+        )
+
+    print(
+        f"   ✅ Production collection contains "
+        f"{final_count:,} documents."
+    )
+
+    # ---------------------------------------------------------------
+    # Cleanup staging collection only after production succeeds.
+    # ---------------------------------------------------------------
+
+    staging_store.delete_collection()
+
+    print(
+        f"🧹 Removed staging collection: "
+        f"{staging_collection}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main ingestion pipeline
+# ---------------------------------------------------------------------------
+
+def ingest() -> None:
+    """Run the complete ingestion pipeline."""
+
+    print("=" * 70)
+    print("EU AI ACT INGESTION")
+    print("=" * 70)
+
+    print(
+        f"\n📄 Source: {PDF_PATH}"
+    )
+
+    print(
+        f"🗂️ Collection: "
+        f"{COLLECTION_NAME}"
+    )
+
+    print(
+        f"📚 Legal version: "
+        f"{LEGAL_VERSION}"
+    )
+
+    print(
+        f"📏 Chunk size: "
+        f"{CHILD_CHUNK_SIZE}"
+    )
+
+    print(
+        f"🔄 Chunk overlap: "
+        f"{CHILD_CHUNK_OVERLAP}"
+    )
+
+    # ---------------------------------------------------------------
+    # 1. Validate source
+    # ---------------------------------------------------------------
+
+    if not PDF_PATH.exists():
+        raise FileNotFoundError(
+            f"Source PDF does not exist: "
+            f"{PDF_PATH}"
+        )
+
+    source_sha256 = sha256_file(
+        PDF_PATH
+    )
+
+    print(
+        f"\n🔐 Source SHA-256: "
+        f"{source_sha256}"
+    )
+
+    # ---------------------------------------------------------------
+    # 2. Extract PDF page-by-page
+    # ---------------------------------------------------------------
+
+    pages = load_pdf_pages(
+        PDF_PATH
+    )
+
+    print(
+        f"📄 Extracted "
+        f"{len(pages):,} pages."
+    )
+
+    text = combine_pages(
+        pages
+    )
+
+    if not text:
+        raise RuntimeError(
+            "PDF extraction produced no text."
+        )
+
+    print(
+        f"📄 Combined text: "
+        f"{len(text):,} characters"
+    )
+
+    # ---------------------------------------------------------------
+    # 3. Detect legal sections
+    # ---------------------------------------------------------------
+
+    sections = split_into_sections(
+        text
+    )
+
+    print(
+        f"✅ Found "
+        f"{len(sections)} legal sections."
+    )
+
+    # ---------------------------------------------------------------
+    # 4. Strict validation
+    # ---------------------------------------------------------------
+
+    validate_sections(
+        sections
+    )
+
+    # ---------------------------------------------------------------
+    # 5. Create parent documents
+    # ---------------------------------------------------------------
+
+    parent_documents = (
+        create_parent_documents(
+            sections,
+            source_sha256=source_sha256,
+        )
+    )
+
+    print(
+        f"\n✅ Created "
+        f"{len(parent_documents)} "
+        "parent documents."
+    )
+
+    # ---------------------------------------------------------------
+    # 6. Create child chunks
+    # ---------------------------------------------------------------
+
+    child_documents = (
+        create_child_chunks(
+            parent_documents,
+            chunk_size=CHILD_CHUNK_SIZE,
+            chunk_overlap=CHILD_CHUNK_OVERLAP,
+        )
+    )
+
+    print(
+        f"\n✅ Created "
+        f"{len(child_documents):,} "
+        "child chunks."
+    )
+
+    # ---------------------------------------------------------------
+    # 7. Validate chunks
+    # ---------------------------------------------------------------
+
+    validate_child_documents(
+        child_documents
+    )
+
+    # ---------------------------------------------------------------
+    # 8. Inspect samples
+    # ---------------------------------------------------------------
+
+    print_sample_chunks(
+        child_documents
+    )
+
+    # ---------------------------------------------------------------
+    # 9. Ingest
+    # ---------------------------------------------------------------
+
+    ingest_documents(
+        child_documents
+    )
+
+    # ---------------------------------------------------------------
+    # 10. Complete
+    # ---------------------------------------------------------------
+
+    print(
+        "\n" + "=" * 70
+    )
+
+    print(
+        "✅ INGESTION COMPLETE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    ingest()
+    try:
+        ingest()
+
+    except KeyboardInterrupt:
+        print(
+            "\n\n⚠️ Ingestion interrupted "
+            "by user."
+        )
+        sys.exit(130)
+
+    except Exception as exc:
+        print(
+            f"\n❌ Ingestion failed: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
