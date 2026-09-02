@@ -3,92 +3,243 @@
 import sys
 sys.path.append('.')
 
+from typing import List, Dict, Any
 from rag.naive import NaiveRAG
-from rag.hybrid import HybridRAG      # We'll build this next
-from rag.advanced import AdvancedRAG  # We'll build this next
+from rag.hybrid import HybridRAG
+from config.settings import CHROMA_DB_PATH
 
-# Predefined test queries with their expected article/chunk
+# ============================================================
+# TEST QUERIES
+# Each query includes a list of expected section IDs (or keywords)
+# that should appear in the top retrieved chunks.
+# ============================================================
 TEST_QUERIES = [
+    # ==========================================
+    # CATEGORY 1: EXPLICIT / FACTOID (Keyword-friendly)
+    # ==========================================
     {
-        "query": "What are the prohibited practices in Article 5?",
-        "expected_keywords": ["subliminal", "vulnerabilities", "social score", "biometric"]
+        "query": "What are the prohibited practices explicitly listed in Article 5?",
+        "expected": ["article_5"],
+        "keywords": ["prohibited", "subliminal", "vulnerabilities"]
     },
     {
-        "query": "What is the risk level of Article 5?",
-        "expected_keywords": ["unacceptable", "prohibited"]
+        "query": "What does Article 9 require for risk management systems?",
+        "expected": ["article_9"],
+        "keywords": ["risk", "management"]
     },
     {
-        "query": "What are the prohibited practices in Article 5?",
-        "expected_keywords": ["subliminal", "vulnerabilities", "social score", "biometric"]
-    },
-    {
-        "query": "What is the risk level of Article 5?",
-        "expected_keywords": ["unacceptable", "prohibited"]
-    },
-    {
-        "query": "What does Article 9 require for risk management?",
-        "expected_keywords": ["continuous process", "identify", "assess", "mitigate"]
-    },
-    {
-        "query": "What are the data governance obligations in Article 10?",
-        "expected_keywords": ["datasets", "representative", "bias-free", "documentation"]
-    },
-    {
-        "query": "What is the purpose of the Quality Management System in Article 11?",
-        "expected_keywords": ["compliance", "monitoring", "audits", "procedures"]
-    },
-    {
-        "query": "What transparency obligations are outlined in Article 13?",
-        "expected_keywords": ["instructions", "capabilities", "limitations", "inform users"]
+        "query": "What transparency obligations are mandated under Article 13?",
+        "expected": ["article_13"],
+        "keywords": ["transparency", "instructions"]
     },
     {
         "query": "How does Article 14 ensure human oversight?",
-        "expected_keywords": ["supervision", "intervention", "override", "training"]
+        "expected": ["article_14"],
+        "keywords": ["oversight", "human", "intervention"]
     },
     {
-        "query": "What technical requirements are set in Article 15?",
-        "expected_keywords": ["accuracy", "robustness", "cybersecurity", "testing"]
+        "query": "What are the technical accuracy and robustness requirements in Article 15?",
+        "expected": ["article_15"],
+        "keywords": ["accuracy", "robustness"]
     },
     {
-        "query": "What conformity assessment procedures are described in Article 43?",
-        "expected_keywords": ["assessment", "compliance", "documentation", "notified bodies"]
+        "query": "What does Article 43 say about conformity assessment procedures?",
+        "expected": ["article_43"],
+        "keywords": ["conformity", "assessment", "notified body"]
     },
     {
-        "query": "What penalties are established in Article 71?",
-        "expected_keywords": ["fines", "non-compliance", "sanctions", "administrative"]
+        "query": "What financial penalties are established in Article 99?",
+        "expected": ["article_99"],
+        "keywords": ["fines", "penalties"]
     },
     {
-        "query": "What does Annex I list as high-risk AI systems?",
-        "expected_keywords": ["biometric identification", "critical infrastructure", "education", "employment"]
+        "query": "What is the official legal definition of an AI system?",
+        "expected": ["article_3"],
+        "keywords": ["definition", "AI system"]
     },
     {
-        "query": "What standards are referenced in Annex II?",
-        "expected_keywords": ["harmonised standards", "technical specifications", "compliance"]
+        "query": "What categories of high-risk systems are listed in Annex I?",
+        "expected": ["annex_i"],
+        "keywords": ["Annex I", "high-risk"]
+    },
+    {
+        "query": "What does Recital 1 state about the primary purpose of the Regulation?",
+        "expected": ["recital_1"],
+        "keywords": ["purpose", "functioning"]
+    },
+
+    # ==========================================
+    # CATEGORY 2: IMPLICIT / SEMANTIC (Real-world scenarios)
+    # ==========================================
+    {
+        "query": "How are safety risks identified and mitigated during the lifecycle of an automated hiring tool?",
+        "expected": ["article_6", "article_9"],
+        "keywords": ["risk", "mitigation", "lifecycle"]
+    },
+    {
+        "query": "What steps must a company take to prevent dataset bias when training a medical diagnostic model?",
+        "expected": ["article_10"],
+        "keywords": ["data governance", "training datasets", "bias"]
+    },
+    {
+        "query": "What kind of technical documentation needs to be handed over to authorities to prove compliance?",
+        "expected": ["article_11"],
+        "keywords": ["technical documentation", "compliance", "provider"]
+    },
+    {
+        "query": "Are companies required to automatically log events while their high-risk software is running?",
+        "expected": ["article_12"],
+        "keywords": ["record-keeping", "logs", "traceability"]
+    },
+    {
+        "query": "What rules apply to labeling deepfakes or synthetic audio/video so people know it was generated by AI?",
+        "expected": ["article_50"],
+        "keywords": ["transparency", "deepfakes", "synthetic", "watermarking"]
+    },
+    {
+        "query": "When does a foundation model cross the threshold into having systemic risk?",
+        "expected": ["article_51", "article_52"],
+        "keywords": ["general purpose AI", "systemic risk", "FLOPs"]
+    },
+    {
+        "query": "What mandatory evaluations and adversarial tests must developers run on high-impact AI models?",
+        "expected": ["article_53"],
+        "keywords": ["systemic risk", "evaluation", "adversarial testing", "incident reporting"]
+    },
+    {
+        "query": "What are the daily responsibilities of a company deploying a third-party high-risk tool in a bank?",
+        "expected": ["article_26"],
+        "keywords": ["deployer", "monitoring", "use instructions"]
+    },
+    {
+        "query": "If a bug in a core component causes a high-risk application to fail, who is legally accountable along the supply chain?",
+        "expected": ["article_25"],
+        "keywords": ["value chain", "provider", "distributor", "importer"]
+    },
+    {
+        "query": "Is biometric categorization or emotion recognition in a workplace allowed under the law?",
+        "expected": ["article_5", "annex_iii"],
+        "keywords": ["biometric", "workplace", "emotion recognition", "prohibited"]
+    },
+    {
+        "query": "Can police use real-time facial recognition scanners in public streets?",
+        "expected": ["article_5"],
+        "keywords": ["biometric identification", "law enforcement", "public spaces", "exceptions"]
+    },
+    {
+        "query": "What is the ongoing obligation for a company to track their software's performance after it has been launched on the market?",
+        "expected": ["article_60"],
+        "keywords": ["post-market monitoring", "systematic collection", "lifecycle"]
+    },
+    {
+        "query": "How quickly must a developer notify authorities if their system malfunctions and causes a severe accident?",
+        "expected": ["article_61"],
+        "keywords": ["serious incident", "reporting", "market surveillance"]
+    },
+    {
+        "query": "Are free and open-source models completely free from all regulatory burdens?",
+        "expected": ["article_53", "recital"],
+        "keywords": ["open-source", "free and open-source", "exemptions"]
+    },
+    {
+        "query": "Does this legislation apply to software built strictly for military defense or national security?",
+        "expected": ["article_2"],
+        "keywords": ["military", "defense", "national security", "scope"]
+    },
+    {
+        "query": "At what point does modifying an existing algorithm mean it has to go through a brand-new compliance audit?",
+        "expected": ["article_3", "article_43"],
+        "keywords": ["substantial modification", "performance", "conformity assessment"]
+    },
+    {
+        "query": "What internal organizational structures must a manufacturer put in place to ensure ongoing quality control?",
+        "expected": ["article_17"],
+        "keywords": ["quality management", "compliance", "systematic procedures"]
+    },
+
+    # ==========================================
+    # CATEGORY 3: COMPLEX / MULTI-HOP (Advanced RAG tests)
+    # ==========================================
+    {
+        "query": "What are the specific requirements for high-risk educational tools, and who is responsible for monitoring them post-launch?",
+        "expected": ["annex_iii", "article_26", "article_60"],
+        "keywords": ["education", "deployer", "post-market monitoring"]
+    },
+    {
+        "query": "How does the regulation define prohibited manipulative techniques, and what are the maximum fines if a company violates this?",
+        "expected": ["article_5", "article_99"],
+        "keywords": ["subliminal", "fines", "prohibited"]
+    },
+    {
+        "query": "What rules govern General Purpose AI models regarding copyright transparency and technical documentation?",
+        "expected": ["article_53"],
+        "keywords": ["general purpose AI", "copyright", "technical documentation"]
+    },
+    {
+        "query": "What must a deployer do if they notice a high-risk system violating fundamental rights, and what are the penalties for ignoring it?",
+        "expected": ["article_26", "article_99"],
+        "keywords": ["fundamental rights", "deployer", "penalties"]
+    },
+    {
+        "query": "How do the transparency rules for chat interfaces differ from the rules for deepfakes and generated text?",
+        "expected": ["article_50"],
+        "keywords": ["transparency", "chat interface", "deepfakes", "synthetic"]
     }
 ]
+# ============================================================
+# EVALUATION METRICS
+# ============================================================
 
-
-def evaluate_rag(retriever_class, queries):
+def evaluate_retriever(retriever_class, queries: List[Dict], top_k: int = 5) -> Dict[str, float]:
+    """
+    Evaluate Hit Rate @ k and Mean Reciprocal Rank (MRR).
+    
+    Hit: if any of the expected section IDs appears in the top-k results.
+    """
     retriever = retriever_class()
     hit_count = 0
-    mrr_sum = 0
+    mrr_sum = 0.0
     
     for q in queries:
-        results = retriever.vector_store.retrieve(q["query"], top_k=5)
-        # Check if any result contains the expected keywords
-        for i, result in enumerate(results):
-            text = result['text'].lower()
-            if any(kw in text for kw in q["expected_keywords"]):
+        results = retriever.retrieve(q['query'], top_k=top_k)
+        expected_ids = q.get('expected', [])
+        found = False
+        
+        for rank, result in enumerate(results, start=1):
+            meta = result.get('metadata', {})
+            section_id = meta.get('section_id', '')
+            # Check if section_id matches any expected ID (case-insensitive)
+            if any(exp.lower() in section_id.lower() for exp in expected_ids):
                 hit_count += 1
-                mrr_sum += 1.0 / (i + 1)
+                mrr_sum += 1.0 / rank
+                found = True
                 break
+        # If not found, mrr gets 0 for this query (implicit)
     
-    hit_rate = hit_count / len(queries)
-    mrr = mrr_sum / len(queries)
-    return {"hit_rate": hit_rate, "mrr": mrr}
+    n = len(queries)
+    return {
+        'hit_rate': hit_count / n,
+        'mrr': mrr_sum / n,
+    }
+
+# ============================================================
+# MAIN
+# ============================================================
 
 if __name__ == "__main__":
+    print("=" * 60)
+    print("RAG EVALUATION")
+    print("=" * 60)
+    
     results = {}
-    for name, cls in [("Naive", NaiveRAG)]:  # Add other strategies later
-        results[name] = evaluate_rag(cls, TEST_QUERIES)
-        print(f"✅ {name} - Hit Rate: {results[name]['hit_rate']:.2f}, MRR: {results[name]['mrr']:.2f}")
+    for name, cls in [("NaiveRAG", NaiveRAG), ("HybridRAG", HybridRAG)]:
+        print(f"\n🔬 Evaluating {name}...")
+        results[name] = evaluate_retriever(cls, TEST_QUERIES, top_k=5)
+        print(f"   Hit Rate @ 5: {results[name]['hit_rate']:.2%}")
+        print(f"   MRR:          {results[name]['mrr']:.3f}")
+    
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    for name, metrics in results.items():
+        print(f"{name:12} | Hit Rate: {metrics['hit_rate']:.2%} | MRR: {metrics['mrr']:.3f}")
