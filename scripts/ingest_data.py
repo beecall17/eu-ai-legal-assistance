@@ -1,5 +1,5 @@
 # scripts/ingest_data.py
-
+import re
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -10,6 +10,7 @@ import pymupdf4llm
 from rag.vector_store import VectorStore
 from config.settings import EMBEDDING_MODEL, CHROMA_DB_PATH
 from tqdm import tqdm
+
 
 def load_and_chunk_pdf(
     file_path: str,
@@ -35,6 +36,13 @@ def load_and_chunk_pdf(
         file_path,
         remove_headers_footers=True
     )
+
+    # Remove page numbers like "43/144"
+    md_text = re.sub(r'^\d+/\d+\s*$', '', md_text, flags=re.MULTILINE)
+
+    # Remove standalone "EN" or "OJ L, ..." lines
+    md_text = re.sub(r'^(EN|OJ L,.*)$', '', md_text, flags=re.MULTILINE)
+
     print(f"✅ Loaded PDF. Markdown length: {len(md_text)} characters.")
 
     # 3. Split by structural headers (Chapters, Articles, Annexes)
