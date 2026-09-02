@@ -38,10 +38,17 @@ def load_and_chunk_pdf(
     )
 
     # Remove page numbers like "43/144"
-    md_text = re.sub(r'^\d+/\d+\s*$', '', md_text, flags=re.MULTILINE)
+    md_text = re.sub(r'^\s*\d+\s*/\s*\d+\s*$', '', md_text, flags=re.MULTILINE)
 
-    # Remove standalone "EN" or "OJ L, ..." lines
-    md_text = re.sub(r'^(EN|OJ L,.*)$', '', md_text, flags=re.MULTILINE)
+    # Remove standalone "EN" (with possible spaces)
+    md_text = re.sub(r'^\s*EN\s*$', '', md_text, flags=re.MULTILINE)
+
+    # Remove "OJ L, ..." lines (with possible spaces or non-breaking spaces)
+    md_text = re.sub(r'^\s*OJ\s*L,.*$', '', md_text, flags=re.MULTILINE)
+
+    # Optional: strip "Text with EEA relevance"
+    md_text = re.sub(r'^\s*Text with EEA relevance\s*$', '', md_text, flags=re.MULTILINE)
+
 
     print(f"✅ Loaded PDF. Markdown length: {len(md_text)} characters.")
 
