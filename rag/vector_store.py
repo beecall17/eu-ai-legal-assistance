@@ -20,7 +20,7 @@ class VectorStore:
         )
         # Get or create collection
         try:
-            self.collection = self.client.get_collection(collection_name)
+            self.collection = self.client.get_or_create_collection(collection_name)
             print(f"✅ Loaded existing collection: {collection_name}")
         except ValueError:
             self.collection = self.client.create_collection(collection_name)

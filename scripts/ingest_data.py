@@ -4,8 +4,8 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from langchain.text_splitter import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
-from langchain.schema import Document
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
 import pymupdf4llm
 from rag.vector_store import VectorStore
 from config.settings import EMBEDDING_MODEL, CHROMA_DB_PATH
@@ -31,7 +31,7 @@ def load_and_chunk_pdf(
 
     # 2. Convert PDF to Markdown (preserves headings)
     print(f"📄 Loading PDF from: {file_path}")
-    md_text = pymupdf4llm.load_pdf(
+    md_text = pymupdf4llm.to_markdown(
         file_path,
         remove_headers_footers=True
     )
@@ -50,7 +50,7 @@ def load_and_chunk_pdf(
     )
     
     parent_docs = header_splitter.split_text(md_text)
-    print(f"✅ Created {len(parent_docs)} structural parent sections (Chapters/Articles).")
+    print(f"✅ Created {len(parent_docs)} structural parent sections (Chapters/Articles/Annexes).")
 
     # 4. Split each parent into smaller child chunks for vector search
     child_splitter = RecursiveCharacterTextSplitter(
@@ -100,7 +100,12 @@ def ingest():
     # 3. Extract texts and metadata for the vector store
     texts = [doc.page_content for doc in child_docs]
     metadatas = [doc.metadata for doc in child_docs]
-    
+    # Filter out any chunks with empty metadata
+    valid_pairs = [(t, m) for t, m in zip(texts, metadatas) if m and len(m) > 0]
+    if valid_pairs:
+        texts, metadatas = zip(*valid_pairs)
+        texts, metadatas = list(texts), list(metadatas)
+
     # 4. Add documents
     vs.add_documents(texts, metadatas=metadatas)
     print(f"✅ Successfully ingested {len(texts)} chunks into ChromaDB at {CHROMA_DB_PATH}")
