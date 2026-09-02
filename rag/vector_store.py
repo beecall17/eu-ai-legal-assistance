@@ -73,3 +73,23 @@ class VectorStore:
     def count(self) -> int:
         """Return the number of documents in the collection."""
         return self.collection.count()
+
+    def get_all_documents(self) -> List[Dict[str, Any]]:
+        """Retrieve all documents from the collection for building BM25."""
+        # Get the total count
+        total = self.collection.count()
+        if total == 0:
+            return []
+        
+        # Query all documents (ChromaDB limits to 10 by default, so we specify n_results)
+        results = self.collection.get(
+            include=["documents", "metadatas"]
+        )
+        
+        docs = []
+        for i, doc in enumerate(results['documents']):
+            docs.append({
+                'text': doc,
+                'metadata': results['metadatas'][i] if results['metadatas'] else {}
+            })
+        return docs
