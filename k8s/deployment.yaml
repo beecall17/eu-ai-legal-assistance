@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: legal-assistant
-        image: your-dockerhub/eu-ai-legal-assistant:latest  # Replace with your image
+        image: beecall17/eu-ai-legal-assistant:latest  # Replace with your image
         ports:
         - containerPort: 8000
         env:
