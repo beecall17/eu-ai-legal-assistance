@@ -1,0 +1,12 @@
+# k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: legal-assistant-service
+spec:
+  selector:
+    app: legal-assistant
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: ClusterIP  # Use LoadBalancer for external access (cloud)

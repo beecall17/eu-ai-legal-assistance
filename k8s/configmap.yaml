@@ -1,0 +1,9 @@
+# k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: legal-assistant-config
+data:
+  AI_MODEL: "openai/hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+  VLLM_BASE_URL: "https://dullness-tackiness-sneeze.ngrok-free.dev/v1"  # Update this!
+  RAG_STRATEGY: "advanced"
