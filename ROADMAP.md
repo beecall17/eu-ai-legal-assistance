@@ -74,13 +74,13 @@
 - [ ] **vLLM Setup:** Deploy `Llama-3.1-8B-Instruct` using vLLM's OpenAI-compatible server.
 - [ ] **LiteLLM Integration:** Point `.env` to `hosted_vllm/meta-llama/Llama-3.1-8B-Instruct`.
 - [ ] **Quantization:** Deploy an **AWQ** or **GPTQ** 4-bit version of the same model.
-- [ ] **Graph Compilation (Stretch):** Compile the embedding model (`BGE`) via ONNX Runtime/TensorRT to boost embedding generation speed.
+- [-] **Graph Compilation (Stretch):** Compile the embedding model (`BGE`) via ONNX Runtime/TensorRT to boost embedding generation speed. --< skipped >
 
 **Deliverable:** Two local endpoints (FP16 vs 4-bit) running side-by-side, with performance metrics.
 
 ---
 
-### Phase 4: ⚙️ Distributed Training (DDP)
+### Phase 4: ⚙️ Distributed Training (DDP) -- skiped for next time.
 *Goal: Learn distributed training fundamentals.*
 
 - [ ] **Dataset:** Select a small legal dataset (e.g., LexGLUE for classification) and a small model (e.g., `law-ai/InLegalBERT`).
@@ -93,30 +93,14 @@
 
 ---
 
-### Phase 5: ☸️ Containerization & Kubernetes
-*Goal: Package the system for scalability and demonstrate DevOps skills.*
+### Phase 5: ☸️ Containerization 
 
 - [ ] **Dockerize:** Write a `Dockerfile` for the Orchestrator + FastAPI server.
 - [ ] **Dockerize vLLM:** Use the official vLLM Docker image for the model server.
-- [ ] **K8s Manifests:** Write `deployment.yaml` and `service.yaml` for the FastAPI app and vLLM.
-- [ ] **Auto-scaling:** Add a Horizontal Pod Autoscaler (HPA) based on CPU/RAM usage.
-- [ ] **Cloud Deploy:** Deploy to Oracle Cloud's "Always Free" K8s tier (or use a local `kind` cluster).
 
 **Deliverable:** A `docker-compose.yml` for local runs, plus K8s YAMLs ready for cloud deployment.
 
 ---
-
-### Phase 6: 🖥️ Frontend & API (The Polish)
-*Goal: Make it look good for your CV/Portfolio.*
-
-- [ ] **FastAPI Backend:** Build `/chat` (streaming response) and `/health` endpoints.
-- [ ] **Streamlit UI:** Create a simple chat interface that shows:
-  - The AI response.
-  - The retrieved RAG chunks in an expander.
-  - The tool-call trace (e.g., *"Agent called: Extract Metadata"*).
-- [ ] **Error Handling:** Graceful failures and informative user messages.
-
-**Deliverable:** A public GitHub repo with a working demo (add a GIF to the README).
 
 ---
 
@@ -148,18 +132,5 @@
 - **Sprint 1 (Week 1-2):** Phases 0 & 1 (Core Tools + Orchestrator).
 - **Sprint 2 (Week 3-4):** Phase 2 (RAG Pipeline).
 - **Sprint 3 (Week 5-6):** Phase 3 (vLLM & Quantization).
-- **Sprint 4 (Week 7-8):** Phase 4 & 5 (DDP + K8s).
-- **Sprint 5 (Week 9-10):** Phase 6 (Frontend & Polish) + Documentation.
 
 ---
-
-## 🚀 How to Start
-
-1. **Clone the repo** and set up your `.env` with free API keys (OpenAI, Groq, Gemini).
-2. Start with **Phase 0**: Open `core/extractor.py` and finalize the Pydantic schema.
-3. Mark tasks as `[x]` as you complete them.
-4. Keep a log of your experiments (throughput, quantization results) in `/notebooks/`.
-
-> **Remember:** Build vertically! Don't wait for RAG to test your Orchestrator. Use the mock retriever first, then plug in the real DB later.
-
-Happy Building! 🎉
