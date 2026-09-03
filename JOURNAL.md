@@ -6,6 +6,12 @@ phase 1.
 - created orchestrator  -- the router logic to route the preferred tool, or return all (both) tools according to query and context.
 
 phase 2.
-Since this is the legal document,
-parsed with hybird markdownsplitter for parents to have entire article/chapter/annex context and recursive splitter for child to have high quality chuks of child with parents metadata attached. 
- -- High quality chuks/data than random/basic splitting on all. 
+
+
+differnt rag evaluation:
+NaiveRAG     | Hit Rate: 75.00% | MRR: 0.513
+HybridRAG    | Hit Rate: 84.38% | MRR: 0.597
+AdvancedRAG  | Hit Rate: 84.38% | MRR: 0.651
+
+All of the test cases for agentic rag used the advancedrag by the orchestrator. 
+

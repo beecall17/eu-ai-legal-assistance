@@ -5,29 +5,33 @@ from litellm import completion
 from config.settings import AI_MODEL
 from core.extractor import extract_article_structure
 from core.summarizer import generate_summary
-from orchestrator.tools import TOOLS, get_tool_by_name
+from orchestrator.tools import TOOLS, TOOL_FUNCTIONS, get_tool_by_name
 
 class Orchestrator:
     def __init__(self, model: Optional[str] = None):
         self.model = model or AI_MODEL
         self.tools = TOOLS
+        self.tool_functions = TOOL_FUNCTIONS
 
-    def _call_llm(self, user_query: str, context_text: str) -> Dict[str, Any]:
+    def _call_llm(self, user_query: str, context_text: Optional[str] = None) -> Dict[str, Any]:
         """Call the LLM with the tools and return the full response."""
+        user_content = f"User query: {user_query}"
+        if context_text:
+            user_content = f"Context from legal text:\n{context_text}\n\n{user_content}"
+
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful legal assistant that can either extract structured metadata from legal texts "
-                    "or generate summaries. Based on the user's query, decide which tool to use. "
-                    "If the user asks for specific details, risk level, or prohibited practices, use the 'extract_structured_metadata' tool. "
-                    "If the user asks for an overview, explanation, or summary, use the 'generate_text_summary' tool. "
-                    "If the query is ambiguous, prefer the extract tool as it provides more factual data."
+                    "You are an advanced legal assistant equipped with tools for extracting structured metadata, "
+                    "generating summaries, and searching/retrieving relevant context using different RAG strategies "
+                    "(naive, hybrid, advanced search). Based on the user's query, decide which tool(s) to use. "
+                    "Use search tools when context needs to be retrieved, and extraction/summary tools when analyzing text."
                 )
             },
             {
                 "role": "user",
-                "content": f"Context from legal text:\n{context_text}\n\nUser query: {user_query}"
+                "content": user_content
             }
         ]
 
@@ -37,7 +41,7 @@ class Orchestrator:
                 messages=messages,
                 tools=self.tools,
                 tool_choice="auto",  # Let the model decide
-                temperature=0.1,      # Low temperature for consistent routing
+                temperature=0.1,     # Low temperature for consistent routing
                 max_retries=3,
             )
             return response
@@ -52,7 +56,6 @@ class Orchestrator:
                 return "Error: Missing 'text' argument for extraction."
             try:
                 result = extract_article_structure(text)
-                # Convert to a human-readable string (or keep as JSON)
                 return f"Article: {result.article_number}\nTitle: {result.title}\nRisk Level: {result.risk_level}\nProhibited Practices:\n- " + "\n- ".join(result.prohibited_practices)
             except Exception as e:
                 return f"Error during extraction: {e}"
@@ -68,12 +71,21 @@ class Orchestrator:
             except Exception as e:
                 return f"Error during summarization: {e}"
 
+        elif tool_name in self.tool_functions:
+            try:
+                result = self.tool_functions[tool_name](arguments)
+                if isinstance(result, (list, dict)):
+                    return json.dumps(result, indent=2)
+                return str(result)
+            except Exception as e:
+                return f"Error during tool execution ({tool_name}): {e}"
+
         else:
             return f"Unknown tool: {tool_name}"
 
-    def process_query(self, user_query: str, context_text: str) -> str:
+    def process_query(self, user_query: str, context_text: Optional[str] = None) -> str:
         """
-        Main entry point: takes user query and context, routes to the right tool,
+        Main entry point: takes user query and optional context, routes to the right tool,
         and returns the final answer.
         """
         # 1. Get LLM response with tool calls
@@ -93,13 +105,12 @@ class Orchestrator:
             # Combine all results
             return "\n\n".join(results)
         else:
-            # No tools called. If the response is too short or generic, we could ask the model to rephrase.
             direct_response = message.content.strip()
             if not direct_response:
                 return "I'm not sure how to help with that query. Could you rephrase?"
             return direct_response
 
 # Convenience function for easy use
-def orchestrate(user_query: str, context_text: str) -> str:
+def orchestrate(user_query: str, context_text: Optional[str] = None) -> str:
     agent = Orchestrator()
     return agent.process_query(user_query, context_text)

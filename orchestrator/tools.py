@@ -1,10 +1,18 @@
 # orchestrator/tools.py
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Callable
 
-# Tool definitions for the orchestrator
+from rag.naive import NaiveRAG
+from rag.hybrid import HybridRAG
+from rag.advanced import AdvancedRAG
 
-extract_tool = {
+# Initialize RAG retrieval engines
+naive = NaiveRAG()
+hybrid = HybridRAG()
+advanced = AdvancedRAG()
+
+# Tool schema definitions for the orchestrator
+extract_tool: Dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "extract_structured_metadata",
@@ -22,7 +30,7 @@ extract_tool = {
     }
 }
 
-summarize_tool = {
+summarize_tool: Dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "generate_text_summary",
@@ -45,11 +53,79 @@ summarize_tool = {
     }
 }
 
-# List of all tools for easy import
-TOOLS = [extract_tool, summarize_tool]
+search_naive_tool: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_naive",
+        "description": "Retrieve using semantic similarity only. Good for conceptual or high-level questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The user's question."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
 
-# Helper to get tool by name
+search_hybrid_tool: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_hybrid",
+        "description": "Retrieve using a combination of semantic similarity and BM25 keyword search. Good for queries containing specific terminology, names, or IDs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The user's question."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+search_advanced_tool: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_advanced",
+        "description": "Retrieve using hybrid search followed by a cross-encoder reranker. Best for complex queries requiring high precision and strict relevance.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The user's question."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+# Complete list of all available tools for easy import and LLM binding
+TOOLS: List[Dict[str, Any]] = [
+    extract_tool,
+    summarize_tool,
+    search_naive_tool,
+    search_hybrid_tool,
+    search_advanced_tool,
+]
+
+# Mapping of tool names to their underlying executable functions
+TOOL_FUNCTIONS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+    "search_naive": lambda args: naive.retrieve_context(args["query"]),
+    "search_hybrid": lambda args: hybrid.retrieve_context(args["query"]),
+    "search_advanced": lambda args: advanced.retrieve_context(args["query"]),
+}
+
+
 def get_tool_by_name(name: str) -> Dict[str, Any]:
+    """Retrieve a specific tool schema definition by its function name."""
     for tool in TOOLS:
         if tool["function"]["name"] == name:
             return tool
