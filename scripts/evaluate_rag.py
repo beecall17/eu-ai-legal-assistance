@@ -6,6 +6,7 @@ sys.path.append('.')
 from typing import List, Dict, Any
 from rag.naive import NaiveRAG
 from rag.hybrid import HybridRAG
+from rag.advanced import AdvancedRAG
 from config.settings import CHROMA_DB_PATH
 
 # ============================================================
@@ -232,7 +233,11 @@ if __name__ == "__main__":
     print("=" * 60)
     
     results = {}
-    for name, cls in [("NaiveRAG", NaiveRAG), ("HybridRAG", HybridRAG)]:
+    for name, cls in [
+        ("NaiveRAG", NaiveRAG), 
+        ("HybridRAG", HybridRAG), 
+        ("AdvancedRAG", AdvancedRAG)
+        ]:
         print(f"\n🔬 Evaluating {name}...")
         results[name] = evaluate_retriever(cls, TEST_QUERIES, top_k=5)
         print(f"   Hit Rate @ 5: {results[name]['hit_rate']:.2%}")
