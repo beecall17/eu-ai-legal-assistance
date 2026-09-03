@@ -1,0 +1,22 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  legal-assistant:
+    build: .
+    container_name: eu-ai-legal-assistant
+    ports:
+      - "8000:8000"
+    environment:
+      - AI_MODEL=openai/TheBloke/Llama-3.1-8B-Instruct-AWQ
+      - OPENAI_API_BASE=${VLLM_BASE_URL}
+      - OPENAI_API_KEY=dummy
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./data:/app/data  # Mount local data folder for ChromaDB
+      - ./config:/app/config
+      - ./core:/app/core
+      - ./orchestrator:/app/orchestrator
+      - ./rag:/app/rag
+    restart: unless-stopped
